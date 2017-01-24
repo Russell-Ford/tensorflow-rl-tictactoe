@@ -19,6 +19,7 @@ References:
 from __future__ import print_function
 
 import time
+import random
 
 import colorama
 from colorama import Fore, Back, Style
@@ -65,16 +66,21 @@ epsilon_anneal_episodes = 5000
 learning_rate = .001
 
 # Number of training episodes to run
-episode_max = 10000
+episode_max = 50000
 
 # Number of training episodes to accumulate stats
 episode_stats = 100
+
+# Toggle playing against the network
+self_play = False
 
 # Run name for tensorboard
 run_name = "%s" % int(time.time())
 
 # Directory for storing tensorboard summaries
-summary_dir = '/tmp/tensorflow/tictactoe'
+summary_dir = 'summaries'
+
+save_dir = 'checkpoints'
 
 def dump_board(sx, so, move_index=None, win_indices=None, q=None):
     """
@@ -203,12 +209,79 @@ def check_draw(sx, so):
     """
     return np.all(sx+so)
 
+def playVersesNetwork(session, graph_ops, saver):
+    # Initialize variables
+    session.run(tf.initialize_all_variables())
+    checkpoint = tf.train.get_checkpoint_state(save_dir)
+    if checkpoint and checkpoint.model_checkpoint_path:
+        saver.restore(session, checkpoint.model_checkpoint_path)
+
+    # Unpack graph ops
+    q_nn, q_nn_update, s, a, y, loss = graph_ops
+
+
+    # X player state
+    sx_t = np.empty([board_size, board_size], dtype=np.bool)
+    # O player state
+    so_t = np.empty_like(sx_t)
+
+    sx_t[:] = False
+    so_t[:] = False
+
+    move_x = bool(random.getrandbits(1))
+    if move_x:
+        print("You're first")
+    else:
+        print("You're second")
+
+    epsilon = .01
+    terminal = False
+    move_num = 1
+    while not terminal:
+        if(move_x):
+            a_t_index = getValidIndex()
+        else:
+            # Observe the next state
+            s_t = create_state(move_x, sx_t, so_t)
+            # Get Q values for all actions
+            q_t = q_values(session, q_nn, s, s_t)
+            # Choose action based on epsilon-greedy policy
+            q_max_index, a_t_index = choose_action(q_t, sx_t, so_t, epsilon)
+
+        r_t, sx_t, so_t, terminal = apply_action(move_x, sx_t, so_t, a_t_index)
+
+        if terminal:
+            if not r_t:
+                print("Draw!")
+            elif move_x:
+                print("You win!")
+            else:
+                print("You lose!")
+        else:
+            win_indices = None
+        print(Fore.CYAN + "Move:", move_num, Fore.RESET + "\n")
+        dump_board(sx_t, so_t)
+        move_x = not move_x
+        move_num += 1
+
+def getValidIndex():
+    while True:
+        action = int(raw_input("Input index from 0-8 to enter move: "))
+        if(action >= 0) and (action <= 8):
+            return (action / 3, action % 3)
+        else:
+            print("Invalid action")
+
+
 def train(session, graph_ops, summary_ops, saver):
     """
     Train model.
     """
     # Initialize variables
     session.run(tf.initialize_all_variables())
+    checkpoint = tf.train.get_checkpoint_state(save_dir)
+    if checkpoint and checkpoint.model_checkpoint_path:
+        saver.restore(session, checkpoint.model_checkpoint_path)
 
     # Initialize summaries writer for tensorflow
     writer = tf.train.SummaryWriter(summary_dir + "/" + run_name, session.graph)
@@ -243,6 +316,9 @@ def train(session, graph_ops, summary_ops, saver):
         so_t[:] = False
 
         sar_prev = [(None, None, None), (None, None, None)] # [(s, a, r(a)), (s(a), o, r(o)]
+        batch_a = []
+        batch_s = []
+        batch_r = []
 
         move_num = 1
 
@@ -263,10 +339,10 @@ def train(session, graph_ops, summary_ops, saver):
                 # Apply equivalent transforms
                 s_t_prev, a_t_prev = apply_transforms(s_t_prev, a_t_prev)
                 # Update Q network
-                q_update(session, q_nn_update,
-                         s, s_t_prev,
-                         a, a_t_prev,
-                         y, [y_t_prev] * len(s_t_prev))
+                batch_a = np.stack(a_t_prev, axis=0)
+                batch_s = np.stack(s_t_prev, axis=0)
+                batch_r = np.stack([y_t_prev] * len(s_t_prev), axis=0)
+
 
             # Apply action to state
             r_t, sx_t, so_t, terminal = apply_action(move_x, sx_t, so_t, a_t_index)
@@ -287,7 +363,10 @@ def train(session, graph_ops, summary_ops, saver):
                 s_up = s_t + s_t_prev
                 a_up = a_t + a_t_prev
                 y_up = [y_t] * len(s_t) + [y_t_prev] * len(s_t_prev)
-                q_update(session, q_nn_update, s, s_up, a, a_up, y, y_up)
+                batch_a = np.stack(a_t_prev, axis=0)
+                batch_s = np.stack(s_t_prev, axis=0)
+                batch_r = np.stack([y_t_prev] * len(s_t_prev), axis=0)
+                q_update(session, q_nn_update, s, batch_s, a, batch_a, y, batch_r)
 
                 # Get episode loss
                 loss_ep = q_loss(session, loss, s, s_up, a, a_up, y, y_up)
@@ -320,6 +399,7 @@ def train(session, graph_ops, summary_ops, saver):
                                                              loss_summary: mean_loss})
             writer.add_summary(summary_str, episode_num)
             stats = []
+            saver.save(session, save_dir + '/' + 'checkpoint', global_step = episode_num)
 
         # Next episode
         episode_num += 1
@@ -537,7 +617,10 @@ def main(_):
         graph_ops = build_graph()
         summary_ops = build_summaries()
         saver = tf.train.Saver(max_to_keep=5)
-        train(session, graph_ops, summary_ops, saver)
+        if self_play:
+            train(session, graph_ops, summary_ops, saver)
+        else:
+            playVersesNetwork(session, graph_ops, saver)
 
 def parse_flags():
     global run_name, board_size, marks_win, episode_max, learning_rate, gamma, epsilon_initial, \
