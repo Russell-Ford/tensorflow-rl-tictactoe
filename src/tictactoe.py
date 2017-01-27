@@ -60,13 +60,13 @@ epsilon_initial = 1.0
 # Final exploration rate
 epsilon_final = .01
 # Number of training episodes to anneal epsilon
-epsilon_anneal_episodes = 5000
+epsilon_anneal_episodes = 50000
 
 # Learning rate
 learning_rate = .001
 
 # Number of training episodes to run
-episode_max = 50000
+episode_max = 500000
 
 # Number of training episodes to accumulate stats
 episode_stats = 100
@@ -315,10 +315,15 @@ def train(session, graph_ops, summary_ops, saver):
         sx_t[:] = False
         so_t[:] = False
 
-        sar_prev = [(None, None, None), (None, None, None)] # [(s, a, r(a)), (s(a), o, r(o)]
-        batch_a = []
-        batch_s = []
-        batch_r = []
+        p1_actions = []
+        p1_states = []
+        p1_values = []
+        p1_rewards = []
+
+        p2_actions = []
+        p2_states = []
+        p2_values = []
+        p2_rewards = []
 
         move_num = 1
 
@@ -330,19 +335,6 @@ def train(session, graph_ops, summary_ops, saver):
             # Choose action based on epsilon-greedy policy
             q_max_index, a_t_index = choose_action(q_t, sx_t, so_t, epsilon)
 
-            # Retrieve previous player state/action/reward (if present)
-            s_t_prev, a_t_prev, r_t_prev = sar_prev.pop(0)
-
-            if not s_t_prev is None:
-                # Calculate updated Q value
-                y_t_prev = r_t_prev + gamma * q_t[q_max_index]
-                # Apply equivalent transforms
-                s_t_prev, a_t_prev = apply_transforms(s_t_prev, a_t_prev)
-                # Update Q network
-                batch_a = np.stack(a_t_prev, axis=0)
-                batch_s = np.stack(s_t_prev, axis=0)
-                batch_r = np.stack([y_t_prev] * len(s_t_prev), axis=0)
-
 
             # Apply action to state
             r_t, sx_t, so_t, terminal = apply_action(move_x, sx_t, so_t, a_t_index)
@@ -350,34 +342,102 @@ def train(session, graph_ops, summary_ops, saver):
             a_t = np.zeros_like(sx_t, dtype=np.float32)
             a_t[a_t_index] = 1.
 
+            state_test, action_test = apply_transforms(s_t, a_t)
+            # store for batch update to Q network
+            if move_x:
+                num_transforms_x = 0
+                for (state, action) in zip(state_test, action_test):
+                    p1_states.append(state)
+                    p1_actions.append(action)
+                    p1_values.append(q_t[q_max_index])
+                    p1_rewards.append(r_t)
+                    num_transforms_x += 1
+            else:
+                num_transforms_o = 0
+                for (state, action) in zip(state_test, action_test):
+                    p2_states.append(state)
+                    p2_actions.append(action)
+                    p2_values.append(q_t[q_max_index])
+                    p2_rewards.append(r_t)
+                    num_transforms_o += 1
+
+
+
             if terminal: # win or draw
-                y_t = r_t # reward for current player
-                s_t_prev, a_t_prev, r_t_prev = sar_prev[-1] # previous opponent state/action/reward
-                y_t_prev = r_t_prev - gamma * r_t # discounted negative reward for opponent
+                batch_a = []
+                batch_s = []
+                batch_r = []
 
-                # Apply equivalent transforms
-                s_t, a_t = apply_transforms(s_t, a_t)
-                s_t_prev, a_t_prev = apply_transforms(s_t_prev, a_t_prev)
+                if move_x:
+                    r_t = 1
+                    for x in range(1,num_transforms_o + 1):
+                        p2_rewards[-x] = -1
+                else:
+                    r_t = 0
+                    for x in range(1,num_transforms_x + 1):
+                        p1_rewards[-x] = -1
 
-                # Update Q network
-                s_up = s_t + s_t_prev
-                a_up = a_t + a_t_prev
-                y_up = [y_t] * len(s_t) + [y_t_prev] * len(s_t_prev)
-                batch_a = np.stack(a_t_prev, axis=0)
-                batch_s = np.stack(s_t_prev, axis=0)
-                batch_r = np.stack([y_t_prev] * len(s_t_prev), axis=0)
+
+                p1_values.reverse()
+                for x in range(num_transforms_x):
+                    batch_a.append(p1_actions.pop())
+                    batch_s.append(p1_states.pop())
+                    batch_r.append(p1_rewards.pop())
+                    p1_values.pop()
+
+                p1_actions.reverse()
+                p1_states.reverse()
+                p1_rewards.reverse()
+
+                R = 0.0
+
+                for (ai, si, ri, vi) in zip(p1_actions, p1_states, p1_rewards, p1_values):
+                    R = ri + gamma * vi
+                    batch_a.append(ai)
+                    batch_s.append(si)
+                    batch_r.append(R)
+
+                batch_a = np.stack(batch_a, axis=0)
+                batch_s = np.stack(batch_s, axis=0)
+                batch_r = np.stack(batch_r, axis=0)
+
+                #update for p1
                 q_update(session, q_nn_update, s, batch_s, a, batch_a, y, batch_r)
 
-                # Get episode loss
-                loss_ep = q_loss(session, loss, s, s_up, a, a_up, y, y_up)
+                batch_a = []
+                batch_s = []
+                batch_r = []
 
-                # Play test game before next episode
-                length_ep, win_x, win_o = test(session, q_nn, s)
-                stats.append([win_x or win_o, length_ep, loss_ep])
+                p2_values.reverse()
+                for x in range(num_transforms_o):
+                    batch_a.append(p2_actions.pop())
+                    batch_s.append(p2_states.pop())
+                    batch_r.append(p2_rewards.pop())
+                    p2_values.pop()
+
+                p2_actions.reverse()
+                p2_states.reverse()
+                p2_rewards.reverse()
+
+                R = 0.0
+
+                for (ai, si, ri, vi) in zip(p2_actions, p2_states, p2_rewards, p2_values):
+                    R = ri + gamma * vi
+                    batch_a.append(ai)
+                    batch_s.append(si)
+                    batch_r.append(R)
+
+                batch_a = np.stack(batch_a, axis=0)
+                batch_s = np.stack(batch_s, axis=0)
+                batch_r = np.stack(batch_r, axis=0)
+
+                q_update(session, q_nn_update, s, batch_s, a, batch_a, y, batch_r)
+                # Get episode loss
+                loss_ep = q_loss(session, loss, s, batch_s, a, batch_a, y, batch_r)
+
+                stats.append([r_t, move_num, loss_ep])
                 break
 
-            # Store state, action and its reward
-            sar_prev.append((s_t, a_t, r_t))
 
             # Next move
             move_x = not move_x
